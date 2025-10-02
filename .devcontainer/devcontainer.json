@@ -1,0 +1,17 @@
+{
+  "name": "AutoDrive F1Tenth",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "autodrive_f1tenth",
+  "workspaceFolder": "/workspace",
+  "extensions": [
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-iot.vscode-ros"
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "/usr/bin/python3.9",
+    "python.linting.enabled": true,
+    "python.linting.flake8Enabled": true
+  },
+  "remoteUser": "root"
+}

@@ -1,0 +1,6 @@
+source /opt/ros/foxy/setup.bash
+source /workspace/install/setup.bash
+
+ros2 launch autodrive_f1tenth simulator_bringup_rviz.launch.py
+
+ros2 run autodrive_f1tenth teleop_keyboard

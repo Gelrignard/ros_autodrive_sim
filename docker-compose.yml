@@ -1,0 +1,14 @@
+version: '3'
+services:
+  autodrive_f1tenth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    network_mode: host
+    command: sleep infinity
