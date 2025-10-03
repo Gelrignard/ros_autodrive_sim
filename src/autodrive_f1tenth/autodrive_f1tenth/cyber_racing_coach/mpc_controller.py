@@ -166,9 +166,9 @@ class MPCParameters:
             'Q_boundary': 100.0,     # Boundary penalty weight
             'R_delta': 0.1,          # Steering effort weight
             'R_ax': 0.1,             # Accel effort weight
-            'delta_max': 0.4,        # Max steering angle (rad) ~23 deg
+            'delta_max': 0.5236,     # Max steering angle (30 degrees in rad)
             'ax_max': 4.0,           # Max acceleration (m/s^2)
             'ax_min': -8.0,          # Max braking (m/s^2)
-            'v_max': 8.0,            # Max velocity (m/s)
+            'v_max': 22.88,            # Max velocity (m/s)
         }
         return params
