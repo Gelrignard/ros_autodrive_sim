@@ -2,83 +2,93 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import JointState, Imu
+from sensor_msgs.msg import JointState, Imu, LaserScan
 from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
 
 import numpy as np
-import osqp
-from scipy import sparse
-from scipy.linalg import block_diag
+import cvxpy as cp
 import math
+import time
 
-class SimpleMPCNode(Node):
+class CBFMPCNode(Node):
     def __init__(self):
-        super().__init__('simple_mpc_node')
+        super().__init__('cbf_mpc_node')
         
         # Vehicle parameters
-        self.m = 3.47
-        self.lf = 0.15875
-        self.lr = 0.17145
+        self.lf = 0.15
+        self.lr = 0.15
         self.L = self.lf + self.lr
-        self.Iz = 0.04712
-        self.wheel_radius = 0.04
+        self.wheel_radius = 0.06
         
         # MPC parameters
-        self.N = 10  # Longer horizon
-        self.Ts = 0.05
-        self.nx = 6
-        self.nu = 2
-        
-        # Cost matrices - ADJUSTED
-        self.Q = np.diag([50.0, 50.0, 5.0, 20.0, 1.0, 1.0])  # Higher tracking cost
-        self.QN = self.Q * 2  # Terminal cost higher
-        self.R = np.diag([5.0, 0.5])  # LOWER control cost
-        
-        # Control limits
-        self.steering_min = -0.34906585
-        self.steering_max = 0.34906585
-        self.throttle_min = -1.5
-        self.throttle_max = 5.0  # Reduced max throttle
+        self.Ts = 0.05  # 20Hz
         
         # State
         self.x = 0.0
         self.y = 0.0
         self.heading = 0.0
         self.vx = 0.0
-        self.vy = 0.0
         self.yaw_rate = 0.0
         
-        # Previous control
-        self.u_prev = np.array([0.0, 0.0])
+        # LiDAR data
+        self.lidar_ranges = None
+        self.lidar_angles = None
+        self.min_safe_distance = 0.4  # INCREASED from 0.6m
+        self.emergency_distance = 0.35  # Emergency stop threshold
+        
+        # CBF parameters
+        self.cbf_alpha = 10.0  # INCREASED - more conservative
         
         # Data flags
         self.received_ips = False
         self.received_imu = False
-        self.received_left_encoder = False
-        self.received_right_encoder = False
+        self.received_encoder = False
+        self.received_lidar = False
         
         self.left_wheel_vel = 0.0
         self.right_wheel_vel = 0.0
         
+        # Startup management
+        self.start_time = None
+        self.warmup_duration = 3.0
+        self.is_warmed_up = False
+        self.first_control_computed = False
+        
+        # Target velocity
+        self.target_v = 0.0
+        self.max_v = 2
+        
+        # Previous control
+        self.prev_throttle = 0.0
+        self.prev_steering = 0.0
+        
+        # Emergency stop flag
+        self.emergency_stop = False
+        
         # Subscribers
-        self.ips_sub = self.create_subscription(Point, '/autodrive/f1tenth_1/ips', self.ips_callback, 10)
-        self.imu_sub = self.create_subscription(Imu, '/autodrive/f1tenth_1/imu', self.imu_callback, 10)
-        self.left_encoder_sub = self.create_subscription(JointState, '/autodrive/f1tenth_1/left_encoder', self.left_encoder_callback, 10)
-        self.right_encoder_sub = self.create_subscription(JointState, '/autodrive/f1tenth_1/right_encoder', self.right_encoder_callback, 10)
+        self.ips_sub = self.create_subscription(
+            Point, '/autodrive/f1tenth_1/ips', self.ips_callback, 10)
+        self.imu_sub = self.create_subscription(
+            Imu, '/autodrive/f1tenth_1/imu', self.imu_callback, 10)
+        self.left_encoder_sub = self.create_subscription(
+            JointState, '/autodrive/f1tenth_1/left_encoder', self.left_encoder_callback, 10)
+        self.right_encoder_sub = self.create_subscription(
+            JointState, '/autodrive/f1tenth_1/right_encoder', self.right_encoder_callback, 10)
+        self.lidar_sub = self.create_subscription(
+            LaserScan, '/autodrive/f1tenth_1/lidar', self.lidar_callback, 10)
         
         # Publishers
-        self.throttle_pub = self.create_publisher(Float32, '/autodrive/f1tenth_1/throttle_command', 10)
-        self.steering_pub = self.create_publisher(Float32, '/autodrive/f1tenth_1/steering_command', 10)
+        self.throttle_pub = self.create_publisher(
+            Float32, '/autodrive/f1tenth_1/throttle_command', 10)
+        self.steering_pub = self.create_publisher(
+            Float32, '/autodrive/f1tenth_1/steering_command', 10)
         
         # Control timer
         self.control_timer = self.create_timer(self.Ts, self.control_loop)
         
-        # Target velocity
-        self.ref_v = 3.0
-        
         self.iteration = 0
-        self.get_logger().info("🚀 Simple MPC Node Started!")
+        self.get_logger().info("🛡️ CBF-MPC Node Started with Reactive Steering!")
         
     def ips_callback(self, msg):
         self.x = msg.x
@@ -99,243 +109,336 @@ class SimpleMPCNode(Node):
         if len(msg.velocity) > 0:
             self.left_wheel_vel = msg.velocity[0]
             self.update_velocity()
-        if not self.received_left_encoder:
-            self.get_logger().info("✓ Left encoder data received!")
-            self.received_left_encoder = True
+        if not self.received_encoder:
+            self.get_logger().info("✓ Encoder data received!")
+            self.received_encoder = True
     
     def right_encoder_callback(self, msg):
         if len(msg.velocity) > 0:
             self.right_wheel_vel = msg.velocity[0]
             self.update_velocity()
-        if not self.received_right_encoder:
-            self.get_logger().info("✓ Right encoder data received!")
-            self.received_right_encoder = True
+    
+    def lidar_callback(self, msg):
+        self.lidar_ranges = np.array(msg.ranges)
+        self.lidar_angles = np.linspace(msg.angle_min, msg.angle_max, len(msg.ranges))
+        
+        # Filter out invalid readings
+        valid_mask = (self.lidar_ranges > msg.range_min) & (self.lidar_ranges < msg.range_max)
+        self.lidar_ranges = np.where(valid_mask, self.lidar_ranges, msg.range_max)
+        
+        if not self.received_lidar:
+            self.get_logger().info(f"✓ LiDAR data received! {len(self.lidar_ranges)} points")
+            self.received_lidar = True
     
     def update_velocity(self):
         avg_wheel_vel = (self.left_wheel_vel + self.right_wheel_vel) / 2.0
         self.vx = avg_wheel_vel * self.wheel_radius
-        self.vy = 0.0
     
-    def kinematic_bicycle_model(self, x, u):
-        """Kinematic bicycle model."""
-        pos_x, pos_y, heading, vx, vy, yaw_rate = x
-        steering, throttle = u
-        
-        vx_safe = max(abs(vx), 0.1)
-        beta = math.atan(self.lr / self.L * math.tan(steering))
-        
-        x_dot = vx_safe * math.cos(heading + beta)
-        y_dot = vx_safe * math.sin(heading + beta)
-        heading_dot = vx_safe / self.lr * math.sin(beta)
-        vx_dot = throttle
-        vy_dot = 0.0
-        yaw_rate_dot = heading_dot
-        
-        return np.array([x_dot, y_dot, heading_dot, vx_dot, vy_dot, yaw_rate_dot])
-    
-    def discretize_dynamics(self, x, u):
-        """Euler discretization."""
-        x_dot = self.kinematic_bicycle_model(x, u)
-        x_next = x + self.Ts * x_dot
-        return x_next
-    
-    def linearize_dynamics(self, x, u):
-        """Numerical linearization."""
-        eps = 1e-5
-        
-        A = np.zeros((self.nx, self.nx))
-        f0 = self.kinematic_bicycle_model(x, u)
-        
-        for i in range(self.nx):
-            x_plus = x.copy()
-            x_plus[i] += eps
-            f_plus = self.kinematic_bicycle_model(x_plus, u)
-            A[:, i] = (f_plus - f0) / eps
-        
-        B = np.zeros((self.nx, self.nu))
-        for i in range(self.nu):
-            u_plus = u.copy()
-            u_plus[i] += eps
-            f_plus = self.kinematic_bicycle_model(x, u_plus)
-            B[:, i] = (f_plus - f0) / eps
-        
-        Ad = np.eye(self.nx) + self.Ts * A
-        Bd = self.Ts * B
-        
-        return Ad, Bd
-    
-    def generate_reference_trajectory(self):
+    def compute_steering_reference(self):
         """
-        Generate reference trajectory AHEAD of vehicle.
+        Compute steering reference using potential field method.
+        Steer towards open space, away from obstacles.
         """
-        x_ref = np.zeros((self.nx, self.N + 1))
-        u_ref = np.zeros((self.nu, self.N))
+        if self.lidar_ranges is None:
+            return 0.0
         
-        # Velocity error
-        v_error = self.ref_v - self.vx
+        # Consider front 180 degrees
+        front_mask = np.abs(self.lidar_angles) < math.pi / 2
+        front_angles = self.lidar_angles[front_mask]
+        front_ranges = self.lidar_ranges[front_mask]
         
-        for k in range(self.N + 1):
-            # Project forward along current heading
-            x_ref[0, k] = self.x + self.ref_v * math.cos(self.heading) * k * self.Ts
-            x_ref[1, k] = self.y + self.ref_v * math.sin(self.heading) * k * self.Ts
-            x_ref[2, k] = self.heading
-            x_ref[3, k] = self.ref_v
-            x_ref[4, k] = 0.0
-            x_ref[5, k] = 0.0
+        # Compute "attractiveness" of each direction
+        # Higher distance = more attractive
+        # Weight by inverse distance to prioritize avoiding close obstacles
         
-        for k in range(self.N):
-            u_ref[0, k] = 0.0  # Straight
-            # Reference throttle to reach target velocity
-            u_ref[1, k] = np.clip(v_error * 2.0, -1.0, 2.0)
+        weights = np.zeros_like(front_angles)
         
-        return x_ref, u_ref
+        for i, (angle, distance) in enumerate(zip(front_angles, front_ranges)):
+            if distance < 0.5:
+                # Very close obstacle - strong repulsion
+                weights[i] = -10.0 / (distance + 0.1)
+            elif distance < 1.5:
+                # Medium distance - mild repulsion
+                weights[i] = -2.0 / (distance + 0.1)
+            else:
+                # Far away - slight attraction
+                weights[i] = distance / 10.0
+        
+        # Compute weighted average angle (desired direction)
+        if np.sum(np.abs(weights)) > 0:
+            desired_angle = np.average(front_angles, weights=weights)
+        else:
+            desired_angle = 0.0  # Go straight if no clear direction
+        
+        # Convert to steering command (proportional control)
+        # Positive angle = turn left, negative = turn right
+        steering_gain = 2.0
+        steering_ref = np.clip(steering_gain * desired_angle, -0.3, 0.3)
+        
+        return steering_ref
     
-    def solve_mpc(self, x0, x_ref, u_ref):
-        """Solve MPC using OSQP."""
+    def get_critical_obstacles(self):
+        """Get closest obstacles in key sectors."""
+        if self.lidar_ranges is None:
+            return []
+        
+        # Divide front into sectors
+        sectors = {
+            'front': (math.radians(-20), math.radians(20)),
+            'front_left': (math.radians(20), math.radians(60)),
+            'front_right': (math.radians(-60), math.radians(-20)),
+        }
+        
+        critical_obstacles = []
+        
+        for sector_name, (angle_min, angle_max) in sectors.items():
+            sector_distances = []
+            sector_angles = []
+            
+            for angle, distance in zip(self.lidar_angles, self.lidar_ranges):
+                if angle_min <= angle <= angle_max and distance < 5.0:
+                    sector_distances.append(distance)
+                    sector_angles.append(angle)
+            
+            if len(sector_distances) > 0:
+                min_idx = np.argmin(sector_distances)
+                critical_obstacles.append({
+                    'angle': sector_angles[min_idx],
+                    'distance': sector_distances[min_idx],
+                    'sector': sector_name
+                })
+        
+        return critical_obstacles
+    
+    def compute_cbf_constraint(self, x_state, obstacles):
+        """Compute CBF constraint."""
+        x_pos, y_pos, heading, vx = x_state
+        
+        A_list = []
+        b_list = []
+        
+        for obs in obstacles:
+            obs_angle = obs['angle']
+            distance = obs['distance']
+            
+            h = distance - self.min_safe_distance
+            
+            if h < -0.1:
+                continue
+            
+            if h > 2.0:
+                continue
+            
+            approach_rate = vx * math.cos(obs_angle)
+            
+            if approach_rate < 0:
+                continue
+            
+            Lf_h = -approach_rate
+            
+            # Control influence: both steering and throttle affect safety
+            # Steering away from obstacle helps
+            # Throttle increases approach rate
+            
+            # If obstacle is on left (angle > 0), steering right (negative) helps
+            # If obstacle is on right (angle < 0), steering left (positive) helps
+            Lg_h_steering = vx * math.sin(obs_angle) * 2.0  # Steering helps avoid
+            Lg_h_throttle = -math.cos(obs_angle)  # Throttle increases danger
+            
+            A_row = np.array([Lg_h_steering, Lg_h_throttle])
+            b_val = -(Lf_h + self.cbf_alpha * h)
+            
+            A_list.append(A_row)
+            b_list.append(b_val)
+        
+        if len(A_list) == 0:
+            return None, None
+        
+        return np.array(A_list), np.array(b_list)
+    
+    def solve_cbf_qp(self, x_state, obstacles, steering_ref):
+        """Solve CBF-QP for safe control."""
         try:
-            # Linearize along reference
-            Ad_seq = []
-            Bd = None
+            # Reference control
+            v_error = self.target_v - x_state[3]
+            throttle_ref = np.clip(v_error * 1.5, -0.5, 0.8)
             
-            for k in range(self.N):
-                Ad, Bd_k = self.linearize_dynamics(x_ref[:, k], u_ref[:, k])
-                Ad_seq.append(Ad)
-                if Bd is None:
-                    Bd = Bd_k
+            # Use computed steering reference (NOT zero!)
+            u_ref = np.array([steering_ref, throttle_ref])
             
-            # Build QP - SIMPLIFIED (no slack variables for now)
-            # Quadratic cost
-            P = sparse.block_diag([
-                sparse.kron(sparse.eye(self.N), self.Q),
-                self.QN,
-                sparse.kron(sparse.eye(self.N), self.R)
-            ], format='csc')
+            # Decision variables
+            u = cp.Variable(2)
             
-            # Linear cost
-            q_x = np.hstack([self.Q @ x_ref[:, k] for k in range(self.N)])
-            q_x = np.hstack([q_x, self.QN @ x_ref[:, self.N]])
-            q_u = np.hstack([self.R @ u_ref[:, k] for k in range(self.N)])
-            q = np.hstack([-q_x, -q_u])
+            # Objective
+            tracking_cost = cp.sum_squares(u - u_ref)
             
-            # Dynamics constraints
-            diag_As = block_diag(*Ad_seq)
-            G = np.zeros([self.nx * (self.N + 1), self.nx * (self.N + 1)])
-            G[self.nx:diag_As.shape[0] + self.nx, :diag_As.shape[1]] = diag_As
-            K = np.kron(np.eye(self.N + 1), -np.eye(self.nx))
-            Ax = G + K
-            Ax = sparse.csc_matrix(Ax)
+            if self.first_control_computed:
+                smoothness_cost = cp.sum_squares(u - np.array([self.prev_steering, self.prev_throttle]))
+                cost = tracking_cost + 0.3 * smoothness_cost  # Reduced smoothness weight
+            else:
+                cost = tracking_cost
             
-            Bu = sparse.kron(sparse.vstack([sparse.csc_matrix((1, self.N)), sparse.eye(self.N)]), Bd)
+            # Constraints
+            constraints = []
             
-            Aeq = sparse.hstack([Ax, Bu])
+            # Control limits
+            constraints.append(u[0] >= -0.3)
+            constraints.append(u[0] <= 0.3)
+            constraints.append(u[1] >= -1.0)
+            constraints.append(u[1] <= 1.0)
             
-            # Initial condition + linearization error
-            stacking_list = []
-            for k in range(self.N):
-                # Correct linearization error term
-                f_nonlinear = self.discretize_dynamics(x_ref[:, k], u_ref[:, k])
-                f_linear = Ad_seq[k] @ x_ref[:, k] + Bd @ u_ref[:, k]
-                linearize_error = f_nonlinear - f_linear
-                stacking_list.append(linearize_error)
+            # Rate limits
+            if self.first_control_computed:
+                constraints.append(u[0] >= self.prev_steering - 0.15)  # Allow faster steering
+                constraints.append(u[0] <= self.prev_steering + 0.15)
+                constraints.append(u[1] >= self.prev_throttle - 0.4)
+                constraints.append(u[1] <= self.prev_throttle + 0.4)
             
-            linearize_constraint = np.array(stacking_list).reshape(-1)
+            # CBF constraints
+            A_cbf, b_cbf = self.compute_cbf_constraint(x_state, obstacles)
             
-            leq = np.hstack([-x0, -linearize_constraint])
-            ueq = leq
+            cbf_active = False
+            if A_cbf is not None and len(A_cbf) > 0:
+                for i in range(len(A_cbf)):
+                    constraints.append(A_cbf[i] @ u >= b_cbf[i])
+                cbf_active = True
+                
+                if self.iteration % 20 == 0:
+                    self.get_logger().info(f"🛡️ {len(A_cbf)} CBF constraints active")
             
-            # Control constraints
-            Aineq = sparse.hstack([
-                sparse.csc_matrix((self.N * self.nu, (self.N + 1) * self.nx)),
-                sparse.eye(self.N * self.nu)
-            ])
-            lineq = np.tile([self.steering_min, self.throttle_min], self.N)
-            uineq = np.tile([self.steering_max, self.throttle_max], self.N)
+            # Solve QP
+            problem = cp.Problem(cp.Minimize(cost), constraints)
+            problem.solve(solver=cp.OSQP, verbose=False, warm_start=True)
             
-            # Combine
-            A = sparse.vstack([Aeq, Aineq], format='csc')
-            l = np.hstack([leq, lineq])
-            u = np.hstack([ueq, uineq])
-            
-            # Solve
-            prob = osqp.OSQP()
-            prob.setup(P, q, A, l, u, warm_start=True, verbose=False)
-            res = prob.solve()
-            
-            if res.info.status != 'solved':
-                self.get_logger().warn(f"OSQP failed: {res.info.status}")
+            if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+                self.get_logger().warn(f"⚠️ QP status: {problem.status}")
                 return None
             
-            # Extract first control
-            u_opt = res.x[(self.N + 1) * self.nx:(self.N + 1) * self.nx + self.nu]
+            u_opt = u.value
             
-            # Debug logging
-            if self.iteration % 20 == 0:
-                tracking_error = np.linalg.norm(x_ref[:, 0] - x0)
-                self.get_logger().info(f"Tracking error: {tracking_error:.3f}, u_opt: [{u_opt[0]:.3f}, {u_opt[1]:.3f}]")
+            if cbf_active and self.iteration % 20 == 0:
+                deviation = np.linalg.norm(u_opt - u_ref)
+                if deviation > 0.1:
+                    self.get_logger().info(f"🛡️ CBF intervention! Deviation: {deviation:.3f}")
             
             return u_opt
             
         except Exception as e:
-            self.get_logger().error(f"MPC error: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            self.get_logger().error(f"CBF-QP error: {str(e)}")
             return None
     
     def control_loop(self):
         self.iteration += 1
         
         all_sensors_ready = (self.received_ips and self.received_imu and 
-                            self.received_left_encoder and self.received_right_encoder)
+                            self.received_encoder and self.received_lidar)
         
         if not all_sensors_ready:
             if self.iteration % 20 == 0:
                 missing = []
                 if not self.received_ips: missing.append("IPS")
                 if not self.received_imu: missing.append("IMU")
-                if not self.received_left_encoder: missing.append("Left Encoder")
-                if not self.received_right_encoder: missing.append("Right Encoder")
-                self.get_logger().warn(f"Waiting for: {', '.join(missing)}")
+                if not self.received_encoder: missing.append("Encoder")
+                if not self.received_lidar: missing.append("LiDAR")
+                self.get_logger().warn(f"⏳ Waiting for: {', '.join(missing)}")
+            
+            self.publish_control(0.0, 0.0)
             return
         
+        # Initialize start time
+        if self.start_time is None:
+            self.start_time = time.time()
+            self.get_logger().info("🚀 All sensors ready! Starting warmup...")
+        
+        # Get critical obstacles
+        obstacles = self.get_critical_obstacles()
+        
+        # EMERGENCY STOP CHECK
+        if len(obstacles) > 0:
+            min_dist = min([obs['distance'] for obs in obstacles])
+            
+            if min_dist < self.emergency_distance:
+                if not self.emergency_stop:
+                    self.get_logger().error(f"🚨 EMERGENCY STOP! Distance: {min_dist:.2f}m")
+                    self.emergency_stop = True
+                
+                self.publish_control(0.0, -1.0)
+                return
+            else:
+                if self.emergency_stop:
+                    self.get_logger().info("✅ Emergency cleared, resuming...")
+                    self.emergency_stop = False
+        
+        # Warmup phase
+        elapsed = time.time() - self.start_time
+        
+        if elapsed < self.warmup_duration:
+            self.target_v = (elapsed / self.warmup_duration) * self.max_v
+            if self.iteration % 20 == 0:
+                self.get_logger().info(f"🔥 Warmup: {elapsed:.1f}s, target_v={self.target_v:.2f} m/s")
+        else:
+            if not self.is_warmed_up:
+                self.is_warmed_up = True
+                self.get_logger().info("✅ Warmup complete!")
+            self.target_v = self.max_v
+        
         # Current state
-        x0 = np.array([self.x, self.y, self.heading, self.vx, self.vy, self.yaw_rate])
+        x_state = np.array([self.x, self.y, self.heading, self.vx])
         
-        # Generate reference
-        x_ref, u_ref = self.generate_reference_trajectory()
+        # Compute steering reference (REACTIVE AVOIDANCE)
+        steering_ref = self.compute_steering_reference()
         
-        # Solve MPC
-        u_opt = self.solve_mpc(x0, x_ref, u_ref)
+        # Log obstacles and steering
+        if self.iteration % 20 == 0:
+            if len(obstacles) > 0:
+                for obs in obstacles:
+                    self.get_logger().info(
+                        f"📏 {obs['sector']}: {obs['distance']:.2f}m @ {math.degrees(obs['angle']):.1f}°"
+                    )
+            self.get_logger().info(f"🎯 Steering reference: {steering_ref:.3f} rad ({math.degrees(steering_ref):.1f}°)")
+        
+        # Solve CBF-QP
+        u_opt = self.solve_cbf_qp(x_state, obstacles, steering_ref)
         
         if u_opt is None:
-            # Fallback: simple P control
-            steering_cmd = 0.0
-            v_error = self.ref_v - self.vx
-            throttle_cmd = np.clip(v_error * 2.0, -1.0, 2.0)
-        else:
-            steering_cmd = float(np.clip(u_opt[0], self.steering_min, self.steering_max))
-            throttle_cmd = float(np.clip(u_opt[1], self.throttle_min, self.throttle_max))
+            self.get_logger().error("❌ QP failed! Emergency stop.")
+            self.publish_control(0.0, -1.0)
+            return
+        
+        steering_cmd = float(np.clip(u_opt[0], -0.3, 0.3))
+        throttle_cmd = float(np.clip(u_opt[1], -1.0, 1.0))
+        
+        # Update previous control
+        self.prev_steering = steering_cmd
+        self.prev_throttle = throttle_cmd
+        
+        if not self.first_control_computed:
+            self.first_control_computed = True
+            self.get_logger().info("✅ First control computed!")
         
         # Publish
-        steering_msg = Float32()
-        steering_msg.data = steering_cmd
-        self.steering_pub.publish(steering_msg)
-        
-        throttle_msg = Float32()
-        throttle_msg.data = throttle_cmd
-        self.throttle_pub.publish(throttle_msg)
-        
-        self.u_prev = np.array([steering_cmd, throttle_cmd])
+        self.publish_control(steering_cmd, throttle_cmd)
         
         if self.iteration % 20 == 0:
             self.get_logger().info(
-                f"State: x={self.x:.2f}, y={self.y:.2f}, v={self.vx:.2f}, θ={self.heading:.2f} | "
-                f"Ref_v={self.ref_v:.2f} | Control: δ={steering_cmd:.3f}, a={throttle_cmd:.2f}"
+                f"State: x={self.x:.2f}, y={self.y:.2f}, v={self.vx:.2f} (target={self.target_v:.2f}) | "
+                f"Control: δ={steering_cmd:.3f}, a={throttle_cmd:.2f}"
             )
+    
+    def publish_control(self, steering, throttle):
+        """Publish control commands."""
+        steering_msg = Float32()
+        steering_msg.data = steering
+        self.steering_pub.publish(steering_msg)
+        
+        throttle_msg = Float32()
+        throttle_msg.data = throttle
+        self.throttle_pub.publish(throttle_msg)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SimpleMPCNode()
+    node = CBFMPCNode()
     
     try:
         rclpy.spin(node)

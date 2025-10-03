@@ -13,3 +13,28 @@ ros2 launch autodrive_f1tenth simulator_bringup_headless.launch.py
 ros2 run autodrive_f1tenth mpc_racing_node
 
 ros2 run autodrive_f1tenth simple_mpc_node
+
+        # Vehicle parameters
+        self.lf = 0.15
+        self.lr = 0.15
+        self.L = self.lf + self.lr
+        self.wheel_radius = 0.06
+        
+        # MPC parameters
+        self.Ts = 0.05  # 20Hz
+        
+        # State
+        self.x = 0.0
+        self.y = 0.0
+        self.heading = 0.0
+        self.vx = 0.0
+        self.yaw_rate = 0.0
+        
+        # LiDAR data
+        self.lidar_ranges = None
+        self.lidar_angles = None
+        self.min_safe_distance = 0.4  # INCREASED from 0.6m
+        self.emergency_distance = 0.35  # Emergency stop threshold
+        
+        # CBF parameters
+        self.cbf_alpha = 10.0  # INCREASED - more conservative
