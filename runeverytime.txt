@@ -4,3 +4,10 @@ source /workspace/install/setup.bash
 ros2 launch autodrive_f1tenth simulator_bringup_rviz.launch.py
 
 ros2 run autodrive_f1tenth teleop_keyboard
+
+
+# Launch simulator
+ros2 launch autodrive_f1tenth simulator_bringup_headless.launch.py
+
+# In another terminal, run MPC controller
+ros2 run autodrive_f1tenth mpc_racing_node

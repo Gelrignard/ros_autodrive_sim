@@ -19,6 +19,12 @@
   <author email="csamak@clemson.edu">Chinmay Vilas Samak</author>
 
   <depend>rclpy</depend>
+  <depend>python3-casadi</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>ackermann_msgs</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
@@ -27,9 +33,6 @@
 
   <export>
     <build_type>ament_python</build_type>
-    <build_depend>std_msgs</build_depend>
-    <build_depend>geometry_msgs</build_depend>
-    <build_depend>sensor_msgs</build_depend>
   </export>
 
 </package>
