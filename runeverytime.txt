@@ -11,3 +11,5 @@ ros2 launch autodrive_f1tenth simulator_bringup_headless.launch.py
 
 # In another terminal, run MPC controller
 ros2 run autodrive_f1tenth mpc_racing_node
+
+ros2 run autodrive_f1tenth simple_mpc_node
