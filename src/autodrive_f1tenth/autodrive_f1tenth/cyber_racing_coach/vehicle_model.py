@@ -93,10 +93,10 @@ class VehicleParameters:
         TODO: Get actual values from AutoDRIVE technical guide
         """
         params = {
-            'm': 3.47,          # Mass (kg) - PLACEHOLDER
+            'm': 3.96,          # Mass (kg) - PLACEHOLDER
             'Iz': 0.04,         # Yaw inertia (kg*m^2) - PLACEHOLDER
-            'lf': 0.15875,      # Distance CG to front axle (m) - PLACEHOLDER
-            'lr': 0.17145,      # Distance CG to rear axle (m) - PLACEHOLDER
+            'lf': 0.1587,      # Distance CG to front axle (m) - PLACEHOLDER
+            'lr': 0.1553,      # Distance CG to rear axle (m) - PLACEHOLDER
             'Cf': 4.718,        # Front cornering stiffness (N/rad) - PLACEHOLDER
             'Cr': 5.4562,       # Rear cornering stiffness (N/rad) - PLACEHOLDER
             'mu': 1.0,          # Friction coefficient - PLACEHOLDER
