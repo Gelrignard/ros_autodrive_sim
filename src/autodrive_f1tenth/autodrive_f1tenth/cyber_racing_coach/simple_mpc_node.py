@@ -2,451 +2,390 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import JointState, Imu, LaserScan
+from sensor_msgs.msg import JointState, Imu
 from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
 
-import numpy as np
-import cvxpy as cp
-import math
-import time
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point as GeomPoint
 
-class CBFMPCNode(Node):
+import numpy as np
+import math
+import sys
+import os
+
+# Add the cyberracingcoach directory to path for imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from .kinematic_mpc import KMPCPlanner, mpc_config, State
+
+
+class SimpleMPCNode(Node):
     def __init__(self):
-        super().__init__('cbf_mpc_node')
+        super().__init__('simple_mpc_node')
         
-        # Vehicle parameters
-        self.lf = 0.15
-        self.lr = 0.15
-        self.L = self.lf + self.lr
-        self.wheel_radius = 0.06
+        # ========== Vehicle Parameters ==========
+        self.wheel_radius = 0.04  # meters
         
-        # MPC parameters
-        self.Ts = 0.05  # 20Hz
-        
-        # State
+        # ========== State Variables ==========
         self.x = 0.0
         self.y = 0.0
         self.heading = 0.0
         self.vx = 0.0
         self.yaw_rate = 0.0
+        self.steering_angle = 0.0
+        self.beta = 0.0  # Slip angle
         
-        # LiDAR data
-        self.lidar_ranges = None
-        self.lidar_angles = None
-        self.min_safe_distance = 0.4  # INCREASED from 0.6m
-        self.emergency_distance = 0.35  # Emergency stop threshold
-        
-        # CBF parameters
-        self.cbf_alpha = 10.0  # INCREASED - more conservative
-        
-        # Data flags
+        # ========== Sensor Data Flags ==========
         self.received_ips = False
         self.received_imu = False
         self.received_encoder = False
-        self.received_lidar = False
         
         self.left_wheel_vel = 0.0
         self.right_wheel_vel = 0.0
         
-        # Startup management
-        self.start_time = None
-        self.warmup_duration = 3.0
-        self.is_warmed_up = False
-        self.first_control_computed = False
+        # ========== MPC Configuration ==========
+        # Using default parameters from kinematic_mpc.py
+        self.mpc_config = mpc_config()
         
-        # Target velocity
-        self.target_v = 0.0
-        self.max_v = 2
+        # ========== Create Waypoints ==========
+        self.waypoints = self.create_circle_waypoints(
+            radius=3.0, 
+            num_points=100, 
+            target_speed=2.0
+        )
         
-        # Previous control
-        self.prev_throttle = 0.0
-        self.prev_steering = 0.0
+        # ========== Initialize MPC Planner ==========
+        self.get_logger().info("🔧 Initializing MPC planner...")
+        self.mpc_planner = KMPCPlanner(
+            waypoints=self.waypoints,
+            config=self.mpc_config
+        )
+        self.get_logger().info("✓ MPC planner initialized!")
         
-        # Emergency stop flag
-        self.emergency_stop = False
-        
-        # Subscribers
+        # ========== ROS2 Subscribers ==========
         self.ips_sub = self.create_subscription(
-            Point, '/autodrive/f1tenth_1/ips', self.ips_callback, 10)
+            Point, 
+            '/autodrive/f1tenth_1/ips', 
+            self.ips_callback, 
+            10
+        )
+        
         self.imu_sub = self.create_subscription(
-            Imu, '/autodrive/f1tenth_1/imu', self.imu_callback, 10)
+            Imu, 
+            '/autodrive/f1tenth_1/imu', 
+            self.imu_callback, 
+            10
+        )
+        
         self.left_encoder_sub = self.create_subscription(
-            JointState, '/autodrive/f1tenth_1/left_encoder', self.left_encoder_callback, 10)
+            JointState, 
+            '/autodrive/f1tenth_1/left_encoder', 
+            self.left_encoder_callback, 
+            10
+        )
+        
         self.right_encoder_sub = self.create_subscription(
-            JointState, '/autodrive/f1tenth_1/right_encoder', self.right_encoder_callback, 10)
-        self.lidar_sub = self.create_subscription(
-            LaserScan, '/autodrive/f1tenth_1/lidar', self.lidar_callback, 10)
+            JointState, 
+            '/autodrive/f1tenth_1/right_encoder', 
+            self.right_encoder_callback, 
+            10
+        )
         
-        # Publishers
+        # ========== ROS2 Publishers ==========
         self.throttle_pub = self.create_publisher(
-            Float32, '/autodrive/f1tenth_1/throttle_command', 10)
+            Float32, 
+            '/autodrive/f1tenth_1/throttle_command', 
+            10
+        )
+        
         self.steering_pub = self.create_publisher(
-            Float32, '/autodrive/f1tenth_1/steering_command', 10)
+            Float32, 
+            '/autodrive/f1tenth_1/steering_command', 
+            10
+        )
         
-        # Control timer
-        self.control_timer = self.create_timer(self.Ts, self.control_loop)
+        # ========== Control Loop Timer ==========
+        # 10Hz to match MPC DTK=0.1s
+        self.control_timer = self.create_timer(0.1, self.control_loop)
         
+        # ========== Logging ==========
         self.iteration = 0
-        self.get_logger().info("🛡️ CBF-MPC Node Started with Reactive Steering!")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("🚗 Simple MPC Node Started!")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info(f"📊 MPC Configuration:")
+        self.get_logger().info(f"   - Horizon: {self.mpc_config.TK} steps")
+        self.get_logger().info(f"   - Time step: {self.mpc_config.DTK} s")
+        self.get_logger().info(f"   - Max speed: {self.mpc_config.MAX_SPEED} m/s")
+        self.get_logger().info(f"   - Max steering: ±{math.degrees(self.mpc_config.MAX_STEER):.1f}°")
+        self.get_logger().info(f"   - Wheelbase: {self.mpc_config.WB} m")
+        self.get_logger().info("=" * 60)
         
+    def create_circle_waypoints(self, radius=3.0, num_points=100, target_speed=2.0):
+        """
+        Create circular waypoint trajectory
+        
+        Args:
+            radius: Circle radius in meters
+            num_points: Number of waypoints
+            target_speed: Target velocity in m/s
+            
+        Returns:
+            numpy.ndarray [4 x N]: [x, y, yaw, speed]
+        """
+        theta = np.linspace(0, 2*np.pi, num_points)
+        cx = radius * np.cos(theta)
+        cy = radius * np.sin(theta)
+        cyaw = theta + np.pi/2  # Tangent to circle
+        cyaw = np.arctan2(np.sin(cyaw), np.cos(cyaw))  # Normalize to [-pi, pi]
+        sp = np.ones(num_points) * target_speed
+        
+        self.get_logger().info(f"📍 Created circular waypoints:")
+        self.get_logger().info(f"   - Radius: {radius} m")
+        self.get_logger().info(f"   - Points: {num_points}")
+        self.get_logger().info(f"   - Target speed: {target_speed} m/s")
+        
+        return np.array([cx, cy, cyaw, sp])
+    
+    def load_custom_waypoints(self, filepath):
+        """
+        Load waypoints from CSV file
+        
+        Expected format: x, y, yaw, speed (one per line)
+        """
+        try:
+            data = np.loadtxt(filepath, delimiter=',')
+            cx = data[:, 0]
+            cy = data[:, 1]
+            cyaw = data[:, 2]
+            sp = data[:, 3]
+            
+            self.waypoints = np.array([cx, cy, cyaw, sp])
+            self.get_logger().info(f"✓ Loaded {len(cx)} waypoints from {filepath}")
+            return True
+        except Exception as e:
+            self.get_logger().error(f"❌ Failed to load waypoints: {str(e)}")
+            return False
+    
+    # ========== Sensor Callbacks ==========
+    
     def ips_callback(self, msg):
+        """Indoor Positioning System callback"""
         self.x = msg.x
         self.y = msg.y
+        
         if not self.received_ips:
             self.get_logger().info("✓ IPS data received!")
             self.received_ips = True
     
     def imu_callback(self, msg):
+        """IMU callback"""
         self.yaw_rate = msg.angular_velocity.z
-        self.heading += self.yaw_rate * self.Ts
+        
+        # Dead reckoning for heading (integrate yaw rate)
+        self.heading += self.yaw_rate * 0.1  # Assuming 10Hz
+        
+        # Normalize heading to [-pi, pi]
         self.heading = math.atan2(math.sin(self.heading), math.cos(self.heading))
+        
         if not self.received_imu:
             self.get_logger().info("✓ IMU data received!")
             self.received_imu = True
     
     def left_encoder_callback(self, msg):
+        """Left wheel encoder callback"""
         if len(msg.velocity) > 0:
             self.left_wheel_vel = msg.velocity[0]
             self.update_velocity()
+            
         if not self.received_encoder:
             self.get_logger().info("✓ Encoder data received!")
             self.received_encoder = True
     
     def right_encoder_callback(self, msg):
+        """Right wheel encoder callback"""
         if len(msg.velocity) > 0:
             self.right_wheel_vel = msg.velocity[0]
             self.update_velocity()
     
-    def lidar_callback(self, msg):
-        self.lidar_ranges = np.array(msg.ranges)
-        self.lidar_angles = np.linspace(msg.angle_min, msg.angle_max, len(msg.ranges))
-        
-        # Filter out invalid readings
-        valid_mask = (self.lidar_ranges > msg.range_min) & (self.lidar_ranges < msg.range_max)
-        self.lidar_ranges = np.where(valid_mask, self.lidar_ranges, msg.range_max)
-        
-        if not self.received_lidar:
-            self.get_logger().info(f"✓ LiDAR data received! {len(self.lidar_ranges)} points")
-            self.received_lidar = True
-    
     def update_velocity(self):
+        """Calculate forward velocity from wheel encoders"""
         avg_wheel_vel = (self.left_wheel_vel + self.right_wheel_vel) / 2.0
         self.vx = avg_wheel_vel * self.wheel_radius
     
-    def compute_steering_reference(self):
-        """
-        Compute steering reference using potential field method.
-        Steer towards open space, away from obstacles.
-        """
-        if self.lidar_ranges is None:
-            return 0.0
-        
-        # Consider front 180 degrees
-        front_mask = np.abs(self.lidar_angles) < math.pi / 2
-        front_angles = self.lidar_angles[front_mask]
-        front_ranges = self.lidar_ranges[front_mask]
-        
-        # Compute "attractiveness" of each direction
-        # Higher distance = more attractive
-        # Weight by inverse distance to prioritize avoiding close obstacles
-        
-        weights = np.zeros_like(front_angles)
-        
-        for i, (angle, distance) in enumerate(zip(front_angles, front_ranges)):
-            if distance < 0.5:
-                # Very close obstacle - strong repulsion
-                weights[i] = -10.0 / (distance + 0.1)
-            elif distance < 1.5:
-                # Medium distance - mild repulsion
-                weights[i] = -2.0 / (distance + 0.1)
-            else:
-                # Far away - slight attraction
-                weights[i] = distance / 10.0
-        
-        # Compute weighted average angle (desired direction)
-        if np.sum(np.abs(weights)) > 0:
-            desired_angle = np.average(front_angles, weights=weights)
-        else:
-            desired_angle = 0.0  # Go straight if no clear direction
-        
-        # Convert to steering command (proportional control)
-        # Positive angle = turn left, negative = turn right
-        steering_gain = 2.0
-        steering_ref = np.clip(steering_gain * desired_angle, -0.3, 0.3)
-        
-        return steering_ref
-    
-    def get_critical_obstacles(self):
-        """Get closest obstacles in key sectors."""
-        if self.lidar_ranges is None:
-            return []
-        
-        # Divide front into sectors
-        sectors = {
-            'front': (math.radians(-20), math.radians(20)),
-            'front_left': (math.radians(20), math.radians(60)),
-            'front_right': (math.radians(-60), math.radians(-20)),
-        }
-        
-        critical_obstacles = []
-        
-        for sector_name, (angle_min, angle_max) in sectors.items():
-            sector_distances = []
-            sector_angles = []
-            
-            for angle, distance in zip(self.lidar_angles, self.lidar_ranges):
-                if angle_min <= angle <= angle_max and distance < 5.0:
-                    sector_distances.append(distance)
-                    sector_angles.append(angle)
-            
-            if len(sector_distances) > 0:
-                min_idx = np.argmin(sector_distances)
-                critical_obstacles.append({
-                    'angle': sector_angles[min_idx],
-                    'distance': sector_distances[min_idx],
-                    'sector': sector_name
-                })
-        
-        return critical_obstacles
-    
-    def compute_cbf_constraint(self, x_state, obstacles):
-        """Compute CBF constraint."""
-        x_pos, y_pos, heading, vx = x_state
-        
-        A_list = []
-        b_list = []
-        
-        for obs in obstacles:
-            obs_angle = obs['angle']
-            distance = obs['distance']
-            
-            h = distance - self.min_safe_distance
-            
-            if h < -0.1:
-                continue
-            
-            if h > 2.0:
-                continue
-            
-            approach_rate = vx * math.cos(obs_angle)
-            
-            if approach_rate < 0:
-                continue
-            
-            Lf_h = -approach_rate
-            
-            # Control influence: both steering and throttle affect safety
-            # Steering away from obstacle helps
-            # Throttle increases approach rate
-            
-            # If obstacle is on left (angle > 0), steering right (negative) helps
-            # If obstacle is on right (angle < 0), steering left (positive) helps
-            Lg_h_steering = vx * math.sin(obs_angle) * 2.0  # Steering helps avoid
-            Lg_h_throttle = -math.cos(obs_angle)  # Throttle increases danger
-            
-            A_row = np.array([Lg_h_steering, Lg_h_throttle])
-            b_val = -(Lf_h + self.cbf_alpha * h)
-            
-            A_list.append(A_row)
-            b_list.append(b_val)
-        
-        if len(A_list) == 0:
-            return None, None
-        
-        return np.array(A_list), np.array(b_list)
-    
-    def solve_cbf_qp(self, x_state, obstacles, steering_ref):
-        """Solve CBF-QP for safe control."""
-        try:
-            # Reference control
-            v_error = self.target_v - x_state[3]
-            throttle_ref = np.clip(v_error * 1.5, -0.5, 0.8)
-            
-            # Use computed steering reference (NOT zero!)
-            u_ref = np.array([steering_ref, throttle_ref])
-            
-            # Decision variables
-            u = cp.Variable(2)
-            
-            # Objective
-            tracking_cost = cp.sum_squares(u - u_ref)
-            
-            if self.first_control_computed:
-                smoothness_cost = cp.sum_squares(u - np.array([self.prev_steering, self.prev_throttle]))
-                cost = tracking_cost + 0.3 * smoothness_cost  # Reduced smoothness weight
-            else:
-                cost = tracking_cost
-            
-            # Constraints
-            constraints = []
-            
-            # Control limits
-            constraints.append(u[0] >= -0.3)
-            constraints.append(u[0] <= 0.3)
-            constraints.append(u[1] >= -1.0)
-            constraints.append(u[1] <= 1.0)
-            
-            # Rate limits
-            if self.first_control_computed:
-                constraints.append(u[0] >= self.prev_steering - 0.15)  # Allow faster steering
-                constraints.append(u[0] <= self.prev_steering + 0.15)
-                constraints.append(u[1] >= self.prev_throttle - 0.4)
-                constraints.append(u[1] <= self.prev_throttle + 0.4)
-            
-            # CBF constraints
-            A_cbf, b_cbf = self.compute_cbf_constraint(x_state, obstacles)
-            
-            cbf_active = False
-            if A_cbf is not None and len(A_cbf) > 0:
-                for i in range(len(A_cbf)):
-                    constraints.append(A_cbf[i] @ u >= b_cbf[i])
-                cbf_active = True
-                
-                if self.iteration % 20 == 0:
-                    self.get_logger().info(f"🛡️ {len(A_cbf)} CBF constraints active")
-            
-            # Solve QP
-            problem = cp.Problem(cp.Minimize(cost), constraints)
-            problem.solve(solver=cp.OSQP, verbose=False, warm_start=True)
-            
-            if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-                self.get_logger().warn(f"⚠️ QP status: {problem.status}")
-                return None
-            
-            u_opt = u.value
-            
-            if cbf_active and self.iteration % 20 == 0:
-                deviation = np.linalg.norm(u_opt - u_ref)
-                if deviation > 0.1:
-                    self.get_logger().info(f"🛡️ CBF intervention! Deviation: {deviation:.3f}")
-            
-            return u_opt
-            
-        except Exception as e:
-            self.get_logger().error(f"CBF-QP error: {str(e)}")
-            return None
+    # ========== Main Control Loop ==========
     
     def control_loop(self):
+        """Main control loop called at 10Hz"""
         self.iteration += 1
         
-        all_sensors_ready = (self.received_ips and self.received_imu and 
-                            self.received_encoder and self.received_lidar)
+        # Check if all sensors are ready
+        all_sensors_ready = (
+            self.received_ips and 
+            self.received_imu and 
+            self.received_encoder
+        )
         
         if not all_sensors_ready:
-            if self.iteration % 20 == 0:
+            if self.iteration % 10 == 0:  # Log every second
                 missing = []
                 if not self.received_ips: missing.append("IPS")
                 if not self.received_imu: missing.append("IMU")
                 if not self.received_encoder: missing.append("Encoder")
-                if not self.received_lidar: missing.append("LiDAR")
-                self.get_logger().warn(f"⏳ Waiting for: {', '.join(missing)}")
+                self.get_logger().warn(f"⏳ Waiting for sensors: {', '.join(missing)}")
             
+            # Send zero commands while waiting
             self.publish_control(0.0, 0.0)
             return
         
-        # Initialize start time
-        if self.start_time is None:
-            self.start_time = time.time()
-            self.get_logger().info("🚀 All sensors ready! Starting warmup...")
+        # ========== Create Vehicle State ==========
+        vehicle_state = State(
+            x=self.x,
+            y=self.y,
+            delta=self.steering_angle,
+            v=self.vx,
+            yaw=self.heading,
+            yawrate=self.yaw_rate,
+            beta=self.beta
+        )
         
-        # Get critical obstacles
-        obstacles = self.get_critical_obstacles()
-        
-        # EMERGENCY STOP CHECK
-        if len(obstacles) > 0:
-            min_dist = min([obs['distance'] for obs in obstacles])
-            
-            if min_dist < self.emergency_distance:
-                if not self.emergency_stop:
-                    self.get_logger().error(f"🚨 EMERGENCY STOP! Distance: {min_dist:.2f}m")
-                    self.emergency_stop = True
-                
-                self.publish_control(0.0, -1.0)
-                return
-            else:
-                if self.emergency_stop:
-                    self.get_logger().info("✅ Emergency cleared, resuming...")
-                    self.emergency_stop = False
-        
-        # Warmup phase
-        elapsed = time.time() - self.start_time
-        
-        if elapsed < self.warmup_duration:
-            self.target_v = (elapsed / self.warmup_duration) * self.max_v
-            if self.iteration % 20 == 0:
-                self.get_logger().info(f"🔥 Warmup: {elapsed:.1f}s, target_v={self.target_v:.2f} m/s")
-        else:
-            if not self.is_warmed_up:
-                self.is_warmed_up = True
-                self.get_logger().info("✅ Warmup complete!")
-            self.target_v = self.max_v
-        
-        # Current state
-        x_state = np.array([self.x, self.y, self.heading, self.vx])
-        
-        # Compute steering reference (REACTIVE AVOIDANCE)
-        steering_ref = self.compute_steering_reference()
-        
-        # Log obstacles and steering
-        if self.iteration % 20 == 0:
-            if len(obstacles) > 0:
-                for obs in obstacles:
-                    self.get_logger().info(
-                        f"📏 {obs['sector']}: {obs['distance']:.2f}m @ {math.degrees(obs['angle']):.1f}°"
-                    )
-            self.get_logger().info(f"🎯 Steering reference: {steering_ref:.3f} rad ({math.degrees(steering_ref):.1f}°)")
-        
-        # Solve CBF-QP
-        u_opt = self.solve_cbf_qp(x_state, obstacles, steering_ref)
-        
-        if u_opt is None:
-            self.get_logger().error("❌ QP failed! Emergency stop.")
-            self.publish_control(0.0, -1.0)
-            return
-        
-        steering_cmd = float(np.clip(u_opt[0], -0.3, 0.3))
-        throttle_cmd = float(np.clip(u_opt[1], -1.0, 1.0))
-        
-        # Update previous control
-        self.prev_steering = steering_cmd
-        self.prev_throttle = throttle_cmd
-        
-        if not self.first_control_computed:
-            self.first_control_computed = True
-            self.get_logger().info("✅ First control computed!")
-        
-        # Publish
-        self.publish_control(steering_cmd, throttle_cmd)
-        
-        if self.iteration % 20 == 0:
-            self.get_logger().info(
-                f"State: x={self.x:.2f}, y={self.y:.2f}, v={self.vx:.2f} (target={self.target_v:.2f}) | "
-                f"Control: δ={steering_cmd:.3f}, a={throttle_cmd:.2f}"
+        # ========== Run MPC Planner ==========
+        try:
+            # Call the MPC planner
+            steering_cmd, speed_cmd = self.mpc_planner.plan(
+                states=[
+                    vehicle_state.x,
+                    vehicle_state.y,
+                    vehicle_state.delta,
+                    vehicle_state.v,
+                    vehicle_state.yaw,
+                    vehicle_state.yawrate,
+                    vehicle_state.beta
+                ],
+                waypoints=self.waypoints
             )
+            
+            # ========== Convert Speed to Throttle ==========
+            # Simple proportional controller
+            speed_error = speed_cmd - self.vx
+            throttle_cmd = np.clip(speed_error * 0.5, -1.0, 1.0)
+            
+            # ========== Clip Steering Command ==========
+            steering_cmd = np.clip(
+                steering_cmd, 
+                self.mpc_config.MIN_STEER, 
+                self.mpc_config.MAX_STEER
+            )
+            
+            # ========== Update Steering Angle Estimate ==========
+            self.steering_angle = steering_cmd
+            
+            # ========== Publish Control Commands ==========
+            self.publish_control(steering_cmd, throttle_cmd)
+            
+            # ========== Logging ==========
+            if self.iteration % 10 == 0:  # Log every second
+                self.get_logger().info(
+                    f"📍 State: x={self.x:.2f}m, y={self.y:.2f}m, "
+                    f"v={self.vx:.2f}m/s, ψ={math.degrees(self.heading):.1f}° | "
+                    f"🎮 Control: δ={math.degrees(steering_cmd):.1f}°, "
+                    f"throttle={throttle_cmd:.2f}"
+                )
+                
+        except Exception as e:
+            self.get_logger().error(f"❌ MPC error: {str(e)}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            # Send zero commands on error
+            self.publish_control(0.0, 0.0)
     
     def publish_control(self, steering, throttle):
-        """Publish control commands."""
+        """
+        Publish control commands to vehicle
+        
+        Args:
+            steering: Steering angle in radians
+            throttle: Throttle command [-1, 1]
+        """
+        # Publish steering
         steering_msg = Float32()
-        steering_msg.data = steering
+        steering_msg.data = float(steering)
         self.steering_pub.publish(steering_msg)
         
+        # Publish throttle
         throttle_msg = Float32()
-        throttle_msg.data = throttle
+        throttle_msg.data = float(throttle)
         self.throttle_pub.publish(throttle_msg)
+    
+    def visualize_mpc(self, ref_x, ref_y, pred_x, pred_y, ox, oy):
+        """Visualize MPC reference and predicted trajectories"""
+        marker_array = MarkerArray()
+        
+        # Reference trajectory (purple)
+        ref_marker = Marker()
+        ref_marker.header.frame_id = "map"
+        ref_marker.header.stamp = self.get_clock().now().to_msg()
+        ref_marker.ns = "reference"
+        ref_marker.id = 0
+        ref_marker.type = Marker.LINE_STRIP
+        ref_marker.action = Marker.ADD
+        ref_marker.scale.x = 0.05
+        ref_marker.color.r = 0.5
+        ref_marker.color.g = 0.0
+        ref_marker.color.b = 0.5
+        ref_marker.color.a = 1.0
+        
+        for x, y in zip(ref_x, ref_y):
+            p = GeomPoint()
+            p.x = float(x)
+            p.y = float(y)
+            p.z = 0.0
+            ref_marker.points.append(p)
+        
+        marker_array.markers.append(ref_marker)
+        
+        # Predicted trajectory (green)
+        pred_marker = Marker()
+        pred_marker.header.frame_id = "map"
+        pred_marker.header.stamp = self.get_clock().now().to_msg()
+        pred_marker.ns = "predicted"
+        pred_marker.id = 1
+        pred_marker.type = Marker.LINE_STRIP
+        pred_marker.action = Marker.ADD
+        pred_marker.scale.x = 0.05
+        pred_marker.color.r = 0.0
+        pred_marker.color.g = 1.0
+        pred_marker.color.b = 0.0
+        pred_marker.color.a = 1.0
+        
+        for x, y in zip(ox, oy):
+            p = GeomPoint()
+            p.x = float(x)
+            p.y = float(y)
+            p.z = 0.0
+            pred_marker.points.append(p)
+        
+        marker_array.markers.append(pred_marker)
+        
+        self.viz_pub.publish(marker_array)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CBFMPCNode()
     
     try:
+        node = SimpleMPCNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        print("\n🛑 Shutting down...")
+    except Exception as e:
+        print(f"❌ Fatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
