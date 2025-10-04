@@ -273,7 +273,7 @@ class SimpleMPCNode(Node):
             
             # ========== Clip Steering Command ==========
             steering_cmd = np.clip(
-                steering_cmd, 
+                -steering_cmd, 
                 self.mpc_config.MIN_STEER, 
                 self.mpc_config.MAX_STEER
             )
