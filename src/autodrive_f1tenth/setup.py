@@ -27,8 +27,9 @@ setup(
             'autodrive_incoming_bridge = autodrive_f1tenth.autodrive_incoming_bridge:main', # AutoDRIVE incoming ROS 2 bridge
             'autodrive_outgoing_bridge = autodrive_f1tenth.autodrive_outgoing_bridge:main', # AutoDRIVE outgoing ROS 2 bridge
             'teleop_keyboard = autodrive_f1tenth.teleop_keyboard:main', # Teleoperation with keyboard
-            'mpc_racing_node = autodrive_f1tenth.cyber_racing_coach.mpc_racing_node:main',  # ADD MPC Racing Node
-            'simple_mpc_node = autodrive_f1tenth.cyber_racing_coach.simple_mpc_node:main',  # NEW Simple MPC Node
+            # 'mpc_racing_node = autodrive_f1tenth.cyber_racing_coach.mpc_racing_node:main',  # ADD MPC Racing Node
+            # 'simple_mpc_node = autodrive_f1tenth.cyber_racing_coach.simple_mpc_node:main',  # NEW Simple MPC Node
+            'rl_eval_node = autodrive_f1tenth.rl_eval_node:main',
         ],
     },
 )
