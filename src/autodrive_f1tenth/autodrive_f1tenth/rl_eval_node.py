@@ -2,14 +2,13 @@
 
 import rclpy
 from rclpy.node import Node
-import os
-import sys
+from stable_baselines3 import PPO
 import numpy as np
-print(f"Running with NumPy version: {np.__version__}")
 from std_msgs.msg import Float32MultiArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
+import os
 from ament_index_python.packages import get_package_share_directory
 import math
 from tf_transformations import euler_from_quaternion
@@ -18,17 +17,9 @@ class RLEvalNode(Node):
     def __init__(self):
         super().__init__('rl_eval_node')
         
-        # First try direct path to the model in the source directory
-        source_model_path = os.path.join(os.path.dirname(__file__), 'model1004.zip')
-        
-        if os.path.exists(source_model_path):
-            model_path = source_model_path
-            self.get_logger().info(f"Found model in source directory: {model_path}")
-        else:
-            # Get the package directory to locate the model file
-            pkg_dir = get_package_share_directory('autodrive_f1tenth')
-            model_path = os.path.join(pkg_dir, 'autodrive_f1tenth/model1004.zip')
-            self.get_logger().info(f"Looking for model in install directory: {model_path}")
+        # Get the package directory to locate the model file
+        pkg_dir = get_package_share_directory('autodrive_f1tenth')
+        model_path = os.path.join(pkg_dir, 'autodrive_f1tenth/model1004.zip')
         
         # Declare parameters
         self.declare_parameter('model_path', model_path)
@@ -43,28 +34,13 @@ class RLEvalNode(Node):
         self.steering_delta = 0.0
         
         try:
-            # Try importing stable_baselines3 here to catch import errors
-            try:
-                from stable_baselines3 import PPO
-                # Load the pre-trained model - be explicit about file existence
-                if os.path.exists(self.model_path):
-                    self.model = PPO.load(self.model_path)
-                    self.get_logger().info("Model loaded successfully!")
-                elif os.path.exists(self.model_path + ".zip"):
-                    # Try with .zip extension if the file wasn't found
-                    self.model = PPO.load(self.model_path + ".zip")
-                    self.get_logger().info("Model loaded successfully with .zip extension!")
-                else:
-                    self.get_logger().error(f"Model file not found: {self.model_path}")
-                    return
-            except ImportError as e:
-                self.get_logger().error(f"Error importing stable_baselines3: {str(e)}")
-                self.get_logger().error("Try downgrading NumPy: pip install numpy==1.23.5")
-                return
+            # Load the pre-trained model
+            self.model = PPO.load(self.model_path)
+            self.get_logger().info("Model loaded successfully!")
         except Exception as e:
             self.get_logger().error(f"Failed to load model: {str(e)}")
             return
-            
+        
         # Subscribe to standard ROS topics
         self.odom_sub = self.create_subscription(
             Odometry,
@@ -88,7 +64,6 @@ class RLEvalNode(Node):
         self.timer = self.create_timer(0.05, self.prediction_timer_callback)  # 20Hz
             
         self.get_logger().info("RL Evaluation Node is ready")
-
 
     def odom_callback(self, msg):
         self.latest_odom = msg
