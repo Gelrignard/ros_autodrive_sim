@@ -229,7 +229,7 @@ class AutodriveRLNode(Node):
     
     def update_velocity(self):
         """Calculate forward velocity from wheel encoders"""
-        wheel_radius = 0.04  # meters (approximate)
+        wheel_radius = 0.324  # meters (approximate)
         self.velocity = (self.left_wheel_vel + self.right_wheel_vel) / 2.0 * wheel_radius
 
     def prediction_timer_callback(self):
@@ -255,7 +255,7 @@ class AutodriveRLNode(Node):
             throttle_cmd = float(action[1])  # Assuming range [0, 1]
             
             # Scale throttle to appropriate range (optional)
-            throttle_cmd = max(0.0, min(1.0, (throttle_cmd + 1.0) / 2.0))  # Convert from [-1,1] to [0,1]
+            # throttle_cmd = max(0.0, min(1.0, (throttle_cmd + 1.0) / 2.0))  # Convert from [-1,1] to [0,1]
             
             # Create messages
             steering_msg = Float32()
@@ -296,6 +296,12 @@ class AutodriveRLNode(Node):
         scan_ranges = np.where(np.isnan(scan_ranges), 100.0, scan_ranges)
         scan_ranges = np.where(np.isinf(scan_ranges) & (scan_ranges > 0), 100.0, scan_ranges)
         scan_ranges = np.where(np.isinf(scan_ranges) & (scan_ranges < 0), 0.0, scan_ranges)
+
+
+        # bicycle model: X_dot = v * cos(theta), Y_dot = v * sin(theta), theta_dot = (v / L) * tan(delta)
+        L = 0.33  # wheelbase in meters
+        linear_vel_x = self.velocity * math.cos(yaw)
+        linear_vel_y = self.velocity * math.sin(yaw)
         
         # Create observation vector in the format expected by the model (46 dimensions)
         observation = np.concatenate([
@@ -304,8 +310,8 @@ class AutodriveRLNode(Node):
             [self.position[0]],          # poses_x
             [self.position[1]],          # poses_y
             [yaw],                       # poses_theta
-            [self.velocity],             # linear_vels_x (forward velocity)
-            [0.0],                       # linear_vels_y (lateral velocity, not available)
+            [linear_vel_x],              # vels_x
+            [linear_vel_y],              # vels_y
             [self.angular_velocity],     # ang_vels_z
             [0.0],                       # collisions (assume no collision)
             [0.0],                       # lap_times (not tracking)
